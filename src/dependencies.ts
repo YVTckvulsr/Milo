@@ -1,23 +1,51 @@
 import { PRFile, DependencyChange } from './types'
 
-function parseMajor(version: string): number {
-  return parseInt(version.replace(/^[\^~>=<v*]/, '').split('.')[0] ?? '0', 10) || 0
+interface SemVer {
+  major: number
+  minor: number
+  patch: number
+  prerelease: string | null
+  raw: string
+}
+
+function parseSemVer(raw: string): SemVer {
+  const clean = raw.replace(/^[\^~>=<v*\s]+/, '')
+
+  if (!clean || clean === '*' || clean === 'latest' || clean === 'next') {
+    return { major: 0, minor: 0, patch: 0, prerelease: null, raw }
+  }
+
+  const [versionPart = '', prePart = null] = clean.split(/-(.+)/, 2) as [string, string | null]
+  const parts = versionPart.split('.').map(p => parseInt(p, 10) || 0)
+
+  return {
+    major: parts[0] ?? 0,
+    minor: parts[1] ?? 0,
+    patch: parts[2] ?? 0,
+    prerelease: prePart,
+    raw,
+  }
+}
+
+function isWildcard(v: string): boolean {
+  return /^\*$|^latest$|^next$|^experimental$/.test(v.trim())
 }
 
 function classifyChange(from: string, to: string): DependencyChange['type'] {
-  const fromMajor = parseMajor(from)
-  const toMajor = parseMajor(to)
-  if (toMajor > fromMajor) return 'major-bump'
+  if (isWildcard(to)) return 'upgraded'
 
-  const fromNums = from.replace(/^[\^~>=<v]/, '').split('.').map(Number)
-  const toNums = to.replace(/^[\^~>=<v]/, '').split('.').map(Number)
-  for (let i = 0; i < 3; i++) {
-    const a = fromNums[i] ?? 0
-    const b = toNums[i] ?? 0
-    if (b > a) return 'upgraded'
-    if (b < a) return 'downgraded'
-  }
+  const f = parseSemVer(from)
+  const t = parseSemVer(to)
+
+  if (t.major > f.major) return 'major-bump'
+  if (t.major < f.major) return 'downgraded'
+  if (t.minor > f.minor || (t.minor === f.minor && t.patch > f.patch)) return 'upgraded'
+  if (t.minor < f.minor || (t.minor === f.minor && t.patch < f.patch)) return 'downgraded'
   return 'upgraded'
+}
+
+function isPrerelease(version: string): boolean {
+  return parseSemVer(version).prerelease !== null
 }
 
 function parseNpmChanges(file: PRFile): DependencyChange[] {
@@ -35,8 +63,7 @@ function parseNpmChanges(file: PRFile): DependencyChange[] {
     const m = line.match(/^([+-])\s+"(@?[^"]+)":\s+"([^"]+)"/)
     if (!m || m[2] === 'name' || m[2] === 'version') continue
 
-    const [, sign, name, version] = m
-    const ver = version.replace(/^["']|["']$/g, '')
+    const [, sign, name, ver] = m
     if (sign === '-') removed.set(name, { ver, dev: inDev })
     else added.set(name, { ver, dev: inDev })
   }
@@ -45,7 +72,7 @@ function parseNpmChanges(file: PRFile): DependencyChange[] {
 
   for (const [name, { ver, dev }] of added) {
     if (!removed.has(name)) {
-      changes.push({ name, from: null, to: ver, type: 'added', ecosystem: 'npm', isDevDependency: dev })
+      changes.push({ name, from: null, to: ver, type: 'added', ecosystem: 'npm', isDevDependency: dev, isPrerelease: isPrerelease(ver) })
     }
   }
   for (const [name, { ver, dev }] of removed) {
@@ -59,7 +86,9 @@ function parseNpmChanges(file: PRFile): DependencyChange[] {
     changes.push({
       name, from: oldVer, to: entry.ver,
       type: classifyChange(oldVer, entry.ver),
-      ecosystem: 'npm', isDevDependency: dev,
+      ecosystem: 'npm',
+      isDevDependency: dev,
+      isPrerelease: isPrerelease(entry.ver),
     })
   }
 
@@ -73,12 +102,12 @@ function parsePipChanges(file: PRFile): DependencyChange[] {
   const added = new Map<string, string>()
 
   for (const line of file.patch.split('\n')) {
-    const m = line.match(/^([+-])([A-Za-z0-9_\-]+)(==|>=|~=|<=)?(.+)?/)
+    if (line.startsWith('@@') || line.startsWith('+++') || line.startsWith('---')) continue
+    const m = line.match(/^([+-])([A-Za-z0-9_\-]+(?:\[[^\]]+\])?)\s*(?:==|>=|~=|<=|!=|>|<)\s*(.+)/)
     if (!m) continue
-    const [, sign, name, , version] = m
-    const ver = version?.trim() ?? '*'
-    if (sign === '-') removed.set(name.toLowerCase(), ver)
-    else added.set(name.toLowerCase(), ver)
+    const [, sign, name, ver] = m
+    if (sign === '-') removed.set(name.toLowerCase(), ver.trim())
+    else added.set(name.toLowerCase(), ver.trim())
   }
 
   const changes: DependencyChange[] = []
@@ -103,7 +132,8 @@ function parseGoChanges(file: PRFile): DependencyChange[] {
   const added = new Map<string, string>()
 
   for (const line of file.patch.split('\n')) {
-    const m = line.match(/^([+-])\s*require\s+(\S+)\s+(\S+)/) || line.match(/^([+-])\t(\S+)\s+(\S+)/)
+    const m = line.match(/^([+-])\s*require\s+(\S+)\s+(\S+)/)
+      ?? line.match(/^([+-])\t(\S+)\s+(\S+)/)
     if (!m) continue
     const [, sign, name, ver] = m
     if (sign === '-') removed.set(name, ver)
@@ -125,20 +155,17 @@ function parseGoChanges(file: PRFile): DependencyChange[] {
   return changes
 }
 
-const DEP_FILE_PARSERS: Array<{ match: RegExp; parse: (f: PRFile) => DependencyChange[] }> = [
-  { match: /(^|\/)package\.json$/, parse: parseNpmChanges },
+const DEP_PARSERS: Array<{ match: RegExp; parse: (f: PRFile) => DependencyChange[] }> = [
+  { match: /(^|\/)package\.json$/,      parse: parseNpmChanges },
   { match: /(^|\/)requirements.*\.txt$/, parse: parsePipChanges },
-  { match: /(^|\/)go\.mod$/, parse: parseGoChanges },
+  { match: /(^|\/)go\.mod$/,            parse: parseGoChanges },
 ]
 
 export function parseDependencyChanges(files: PRFile[]): DependencyChange[] {
-  const all: DependencyChange[] = []
-  for (const file of files) {
-    for (const { match, parse } of DEP_FILE_PARSERS) {
-      if (match.test(file.filename)) {
-        all.push(...parse(file))
-      }
+  return files.flatMap(file => {
+    for (const { match, parse } of DEP_PARSERS) {
+      if (match.test(file.filename)) return parse(file)
     }
-  }
-  return all
+    return []
+  })
 }

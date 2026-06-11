@@ -1,7 +1,45 @@
 import Anthropic from '@anthropic-ai/sdk'
-import { PRData, AnalysisResults, AIAnalysis, MiloConfig } from './types'
+import { PRData, AnalysisResults, AIAnalysis, MiloConfig, PRFile } from './types'
+import { isTestFile } from './analyzer'
 
-const MAX_DIFF_CHARS = 18000
+const MAX_DIFF_CHARS = 20000
+const SOURCE_EXTENSIONS = /\.(ts|tsx|js|jsx|py|go|java|kt|rb|rs|c|cpp|cs|swift|php)$/
+
+function filePriority(f: PRFile): number {
+  if (!f.patch) return -1
+  let score = f.additions + f.deletions
+  if (SOURCE_EXTENSIONS.test(f.filename)) score += 200
+  if (isTestFile(f.filename)) score -= 50
+  if (/\.(md|txt|json|lock)$/.test(f.filename)) score -= 100
+  return score
+}
+
+/** Build a diff string that fits in maxChars, prioritising high-complexity source files. */
+function buildFocusedDiff(prData: PRData, maxChars: number): { diff: string; skipped: string[] } {
+  const sorted = [...prData.files]
+    .filter(f => f.patch)
+    .sort((a, b) => filePriority(b) - filePriority(a))
+
+  const included: string[] = []
+  const skipped: string[] = []
+  let total = 0
+
+  for (const f of sorted) {
+    const chunk = `--- a/${f.filename}\n+++ b/${f.filename}\n${f.patch}`
+    if (total + chunk.length <= maxChars) {
+      included.push(chunk)
+      total += chunk.length
+    } else {
+      skipped.push(f.filename)
+    }
+  }
+
+  if (skipped.length > 0) {
+    included.push(`\n[${skipped.length} low-priority file(s) omitted: ${skipped.join(', ')}]`)
+  }
+
+  return { diff: included.join('\n\n'), skipped }
+}
 
 export async function getAIAnalysis(
   prData: PRData,
@@ -10,48 +48,46 @@ export async function getAIAnalysis(
   config: MiloConfig
 ): Promise<AIAnalysis> {
   const client = new Anthropic({ apiKey })
-
-  const diff = prData.diff.length > MAX_DIFF_CHARS
-    ? prData.diff.slice(0, MAX_DIFF_CHARS) + '\n\n[diff truncated for length]'
-    : prData.diff
+  const { diff, skipped } = buildFocusedDiff(prData, MAX_DIFF_CHARS)
 
   const staticContext = [
-    analysis.secrets.length > 0          && `- ${analysis.secrets.length} potential secret(s): ${analysis.secrets.map(s => s.type).join(', ')}`,
-    analysis.breaking.length > 0         && `- ${analysis.breaking.length} possible breaking change(s): ${analysis.breaking.map(b => b.description).slice(0, 3).join('; ')}`,
-    analysis.dependencies.length > 0     && `- Dependency changes: ${analysis.dependencies.map(d => `${d.name} (${d.type})`).slice(0, 5).join(', ')}`,
-    analysis.coverageGaps.filter(g => !g.hasTests).length > 0 && `- ${analysis.coverageGaps.filter(g => !g.hasTests).length} file(s) changed without test updates`,
-    analysis.todos.length > 0            && `- ${analysis.todos.length} new TODO/FIXME added`,
-  ].filter(Boolean).join('\n') || '  Nothing flagged by static analysis'
+    analysis.secrets.length > 0         && `- ${analysis.secrets.length} potential secret(s): ${analysis.secrets.map(s => s.type).join(', ')}`,
+    analysis.breaking.length > 0        && `- ${analysis.breaking.length} possible breaking change(s): ${analysis.breaking.map(b => b.description).slice(0, 3).join('; ')}`,
+    analysis.dependencies.length > 0    && `- Dependency changes: ${analysis.dependencies.map(d => `${d.name} (${d.type})`).slice(0, 5).join(', ')}`,
+    analysis.coverageGaps.filter(g => !g.hasTests).length > 0 && `- ${analysis.coverageGaps.filter(g => !g.hasTests).length} file(s) without test coverage`,
+    analysis.todos.length > 0           && `- ${analysis.todos.length} new TODO/FIXME`,
+    skipped.length > 0                  && `- Note: ${skipped.length} file(s) were not included in the diff above (too large)`,
+  ].filter(Boolean).join('\n') || '  Nothing flagged'
 
   const prompt = `You are a senior software engineer doing a first-pass review of a pull request.
 
 PR Title: ${prData.title}
 PR Description: ${prData.description || '(none provided)'}
-Changed files (${prData.changedFiles}, +${prData.additions}/-${prData.deletions} lines):
+Changed files (${prData.changedFiles} total, +${prData.additions}/-${prData.deletions} lines):
 ${prData.files.slice(0, 30).map(f => `  ${f.status === 'added' ? '+' : f.status === 'deleted' ? '-' : ' '} ${f.filename} (+${f.additions}/-${f.deletions})`).join('\n')}
 
 Static analysis already found:
 ${staticContext}
 
-Diff:
+Diff (high-priority files first):
 \`\`\`diff
 ${diff}
 \`\`\`
 
-Respond with ONLY a valid JSON object — no markdown fences, no explanation:
+Respond with ONLY a valid JSON object — no markdown, no explanation:
 {
-  "summary": "2-3 sentences on WHAT this PR does and WHY (not how)",
-  "concerns": ["specific, actionable concern", "..."],
-  "suggestions": ["specific suggestion referencing actual code", "..."],
-  "splitSuggestion": "concrete split recommendation if the PR mixes unrelated concerns"
+  "summary": "2-3 sentences: WHAT this PR does and WHY (not how). Be specific.",
+  "concerns": ["specific issue referencing actual code", "..."],
+  "suggestions": ["actionable suggestion referencing a function/file name", "..."],
+  "splitSuggestion": "concrete split if PR mixes unrelated concerns"
 }
 
 Rules:
-- summary: non-obvious context only — what problem does this solve?
-- concerns: real code issues, logic bugs, security risks, performance (max 4, skip trivial style)
-- suggestions: reference actual function names, file names, or patterns in the diff (max 4)
+- summary: explain the problem being solved, not the implementation
+- concerns: real issues only (logic bug, security risk, missing edge case) — max 4, skip style
+- suggestions: reference actual symbols or files from the diff — max 4
 - splitSuggestion: omit the key entirely if the PR is focused
-- Each item under 130 characters`
+- Each item < 130 characters`
 
   const message = await client.messages.create({
     model: config.ai.model,

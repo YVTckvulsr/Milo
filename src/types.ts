@@ -7,6 +7,7 @@ export interface PRData {
   deletions: number
   changedFiles: number
   headSha: string
+  isDraft: boolean
 }
 
 export interface PRFile {
@@ -30,6 +31,7 @@ export interface SecretFinding {
   line: number
   type: string
   snippet: string
+  entropy: number
 }
 
 export interface TodoFinding {
@@ -40,8 +42,11 @@ export interface TodoFinding {
 
 export interface CoverageGap {
   file: string
+  /** true if a test file was changed in this PR or an existing test file was found in the repo */
   hasTests: boolean
   isNewFile: boolean
+  /** true when coverage was confirmed via repo tree lookup, not just PR diff inspection */
+  confirmedByTree?: boolean
 }
 
 export interface DependencyChange {
@@ -51,6 +56,7 @@ export interface DependencyChange {
   type: 'added' | 'removed' | 'major-bump' | 'upgraded' | 'downgraded'
   ecosystem: 'npm' | 'pip' | 'go' | 'cargo' | 'unknown'
   isDevDependency: boolean
+  isPrerelease?: boolean
 }
 
 export interface BreakingChange {
@@ -95,14 +101,16 @@ export interface MiloConfig {
   thresholds: {
     fail_on_score_below: number
     max_pr_lines: number
+    secret_entropy_min: number
   }
   ignore: {
     paths: string[]
   }
-  custom_secrets: Array<{ name: string; pattern: string }>
+  custom_secrets: Array<{ name: string; pattern: string; require_entropy?: boolean }>
   ai: {
     model: string
   }
+  skip_drafts: boolean
 }
 
 export const DEFAULT_CONFIG: MiloConfig = {
@@ -124,6 +132,7 @@ export const DEFAULT_CONFIG: MiloConfig = {
   thresholds: {
     fail_on_score_below: 0,
     max_pr_lines: 1000,
+    secret_entropy_min: 3.5,
   },
   ignore: {
     paths: [],
@@ -132,4 +141,5 @@ export const DEFAULT_CONFIG: MiloConfig = {
   ai: {
     model: 'claude-sonnet-4-6',
   },
+  skip_drafts: true,
 }

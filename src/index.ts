@@ -1,6 +1,6 @@
 import * as core from '@actions/core'
 import * as github from '@actions/github'
-import { fetchPRData, upsertComment, createCheckRun } from './github'
+import { fetchPRData, upsertComment, createCheckRun, enrichCoverageGaps } from './github'
 import { runAnalysis } from './analyzer'
 import { getAIAnalysis } from './ai'
 import { formatComment, calculateHealthScore } from './reporter'
@@ -29,8 +29,21 @@ async function run(): Promise<void> {
       fetchPRData(owner, repo, prNumber, token),
     ])
 
+    if (prData.isDraft && config.skip_drafts) {
+      core.info('⏭️  PR is a draft — skipping (set skip_drafts: false in .milo.yml to enable)')
+      return
+    }
+
     core.info('📊 Running static analysis...')
-    const analysis = runAnalysis(prData, config)
+    let analysis = runAnalysis(prData, config)
+
+    // Enrich coverage gaps: check if test files EXIST in the repo
+    // (not just whether they were changed in this PR)
+    if (config.checks.tests && analysis.coverageGaps.some(g => !g.hasTests)) {
+      core.info('🌲 Checking test file existence in repo...')
+      const enriched = await enrichCoverageGaps(owner, repo, prData.headSha, analysis.coverageGaps, token)
+      analysis = { ...analysis, coverageGaps: enriched }
+    }
 
     let aiAnalysis = null
     if (anthropicKey) {
