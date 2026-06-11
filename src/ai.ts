@@ -1,59 +1,60 @@
 import Anthropic from '@anthropic-ai/sdk'
-import { PRData, AnalysisResults, AIAnalysis } from './types'
+import { PRData, AnalysisResults, AIAnalysis, MiloConfig } from './types'
 
 const MAX_DIFF_CHARS = 18000
 
 export async function getAIAnalysis(
   prData: PRData,
   analysis: AnalysisResults,
-  apiKey: string
+  apiKey: string,
+  config: MiloConfig
 ): Promise<AIAnalysis> {
   const client = new Anthropic({ apiKey })
 
   const diff = prData.diff.length > MAX_DIFF_CHARS
-    ? prData.diff.slice(0, MAX_DIFF_CHARS) + '\n\n[diff truncated]'
+    ? prData.diff.slice(0, MAX_DIFF_CHARS) + '\n\n[diff truncated for length]'
     : prData.diff
 
-  const staticFindings = [
-    analysis.secrets.length > 0 && `- ${analysis.secrets.length} potential secret(s) detected`,
-    analysis.todos.length > 0 && `- ${analysis.todos.length} new TODO/FIXME added`,
-    analysis.coverageGaps.filter(g => !g.hasTests).length > 0 &&
-      `- Files without test coverage: ${analysis.coverageGaps.filter(g => !g.hasTests).map(g => g.file).join(', ')}`,
-  ].filter(Boolean).join('\n')
+  const staticContext = [
+    analysis.secrets.length > 0          && `- ${analysis.secrets.length} potential secret(s): ${analysis.secrets.map(s => s.type).join(', ')}`,
+    analysis.breaking.length > 0         && `- ${analysis.breaking.length} possible breaking change(s): ${analysis.breaking.map(b => b.description).slice(0, 3).join('; ')}`,
+    analysis.dependencies.length > 0     && `- Dependency changes: ${analysis.dependencies.map(d => `${d.name} (${d.type})`).slice(0, 5).join(', ')}`,
+    analysis.coverageGaps.filter(g => !g.hasTests).length > 0 && `- ${analysis.coverageGaps.filter(g => !g.hasTests).length} file(s) changed without test updates`,
+    analysis.todos.length > 0            && `- ${analysis.todos.length} new TODO/FIXME added`,
+  ].filter(Boolean).join('\n') || '  Nothing flagged by static analysis'
 
   const prompt = `You are a senior software engineer doing a first-pass review of a pull request.
 
 PR Title: ${prData.title}
-PR Description: ${prData.description || '(none)'}
+PR Description: ${prData.description || '(none provided)'}
+Changed files (${prData.changedFiles}, +${prData.additions}/-${prData.deletions} lines):
+${prData.files.slice(0, 30).map(f => `  ${f.status === 'added' ? '+' : f.status === 'deleted' ? '-' : ' '} ${f.filename} (+${f.additions}/-${f.deletions})`).join('\n')}
 
-Changed files (${prData.changedFiles} total, +${prData.additions}/-${prData.deletions} lines):
-${prData.files.slice(0, 30).map(f => `  ${f.status === 'added' ? '+ ' : f.status === 'deleted' ? '- ' : '  '}${f.filename} (+${f.additions}/-${f.deletions})`).join('\n')}
-
-Static analysis found:
-${staticFindings || '  Nothing concerning'}
+Static analysis already found:
+${staticContext}
 
 Diff:
 \`\`\`diff
 ${diff}
 \`\`\`
 
-Respond with ONLY a JSON object — no markdown, no explanation:
+Respond with ONLY a valid JSON object — no markdown fences, no explanation:
 {
-  "summary": "2-3 sentences describing what this PR does and why",
-  "concerns": ["specific concern 1", "specific concern 2"],
-  "suggestions": ["actionable suggestion 1", "actionable suggestion 2"],
-  "splitSuggestion": "how to split this PR if it's too large (omit this key if not needed)"
+  "summary": "2-3 sentences on WHAT this PR does and WHY (not how)",
+  "concerns": ["specific, actionable concern", "..."],
+  "suggestions": ["specific suggestion referencing actual code", "..."],
+  "splitSuggestion": "concrete split recommendation if the PR mixes unrelated concerns"
 }
 
 Rules:
-- summary: explain the WHAT and WHY, not how
-- concerns: only real issues, not nitpicks (max 4)
-- suggestions: actionable and specific (max 4)
-- splitSuggestion: only include if PR has 200+ lines changed across unrelated concerns
-- Keep each item under 120 characters`
+- summary: non-obvious context only — what problem does this solve?
+- concerns: real code issues, logic bugs, security risks, performance (max 4, skip trivial style)
+- suggestions: reference actual function names, file names, or patterns in the diff (max 4)
+- splitSuggestion: omit the key entirely if the PR is focused
+- Each item under 130 characters`
 
   const message = await client.messages.create({
-    model: 'claude-sonnet-4-6',
+    model: config.ai.model,
     max_tokens: 1024,
     messages: [{ role: 'user', content: prompt }],
   })
@@ -62,7 +63,7 @@ Rules:
   if (content.type !== 'text') throw new Error('Unexpected AI response type')
 
   const jsonMatch = content.text.match(/\{[\s\S]*\}/)
-  if (!jsonMatch) throw new Error('Could not parse AI response as JSON')
+  if (!jsonMatch) throw new Error('Could not extract JSON from AI response')
 
   return JSON.parse(jsonMatch[0]) as AIAnalysis
 }

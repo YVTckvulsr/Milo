@@ -1,17 +1,17 @@
 name: 'Milo PR Health Check'
-description: 'Zero-config AI-powered PR analysis — like a senior dev doing the first pass on every PR.'
+description: 'Zero-config AI-powered PR analysis — secrets, test gaps, breaking changes, dependency shifts, and auto-labels.'
 author: 'yvtckvulsr'
 
 inputs:
   github-token:
-    description: 'GitHub token for posting comments'
+    description: 'GitHub token for posting comments, applying labels, and creating checks'
     required: true
     default: ${{ github.token }}
   anthropic-api-key:
-    description: 'Anthropic API key for AI-powered analysis (optional — enables summary, concerns, and split suggestions)'
+    description: 'Anthropic API key — enables AI summary, concerns, and split suggestions (optional)'
     required: false
   fail-on-secrets:
-    description: 'Fail the workflow if potential secrets are detected'
+    description: 'Fail the workflow when potential secrets are detected'
     required: false
     default: 'true'
 

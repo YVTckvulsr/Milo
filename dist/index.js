@@ -35650,49 +35650,49 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.getAIAnalysis = getAIAnalysis;
 const sdk_1 = __importDefault(__nccwpck_require__(121));
 const MAX_DIFF_CHARS = 18000;
-async function getAIAnalysis(prData, analysis, apiKey) {
+async function getAIAnalysis(prData, analysis, apiKey, config) {
     const client = new sdk_1.default({ apiKey });
     const diff = prData.diff.length > MAX_DIFF_CHARS
-        ? prData.diff.slice(0, MAX_DIFF_CHARS) + '\n\n[diff truncated]'
+        ? prData.diff.slice(0, MAX_DIFF_CHARS) + '\n\n[diff truncated for length]'
         : prData.diff;
-    const staticFindings = [
-        analysis.secrets.length > 0 && `- ${analysis.secrets.length} potential secret(s) detected`,
+    const staticContext = [
+        analysis.secrets.length > 0 && `- ${analysis.secrets.length} potential secret(s): ${analysis.secrets.map(s => s.type).join(', ')}`,
+        analysis.breaking.length > 0 && `- ${analysis.breaking.length} possible breaking change(s): ${analysis.breaking.map(b => b.description).slice(0, 3).join('; ')}`,
+        analysis.dependencies.length > 0 && `- Dependency changes: ${analysis.dependencies.map(d => `${d.name} (${d.type})`).slice(0, 5).join(', ')}`,
+        analysis.coverageGaps.filter(g => !g.hasTests).length > 0 && `- ${analysis.coverageGaps.filter(g => !g.hasTests).length} file(s) changed without test updates`,
         analysis.todos.length > 0 && `- ${analysis.todos.length} new TODO/FIXME added`,
-        analysis.coverageGaps.filter(g => !g.hasTests).length > 0 &&
-            `- Files without test coverage: ${analysis.coverageGaps.filter(g => !g.hasTests).map(g => g.file).join(', ')}`,
-    ].filter(Boolean).join('\n');
+    ].filter(Boolean).join('\n') || '  Nothing flagged by static analysis';
     const prompt = `You are a senior software engineer doing a first-pass review of a pull request.
 
 PR Title: ${prData.title}
-PR Description: ${prData.description || '(none)'}
+PR Description: ${prData.description || '(none provided)'}
+Changed files (${prData.changedFiles}, +${prData.additions}/-${prData.deletions} lines):
+${prData.files.slice(0, 30).map(f => `  ${f.status === 'added' ? '+' : f.status === 'deleted' ? '-' : ' '} ${f.filename} (+${f.additions}/-${f.deletions})`).join('\n')}
 
-Changed files (${prData.changedFiles} total, +${prData.additions}/-${prData.deletions} lines):
-${prData.files.slice(0, 30).map(f => `  ${f.status === 'added' ? '+ ' : f.status === 'deleted' ? '- ' : '  '}${f.filename} (+${f.additions}/-${f.deletions})`).join('\n')}
-
-Static analysis found:
-${staticFindings || '  Nothing concerning'}
+Static analysis already found:
+${staticContext}
 
 Diff:
 \`\`\`diff
 ${diff}
 \`\`\`
 
-Respond with ONLY a JSON object — no markdown, no explanation:
+Respond with ONLY a valid JSON object — no markdown fences, no explanation:
 {
-  "summary": "2-3 sentences describing what this PR does and why",
-  "concerns": ["specific concern 1", "specific concern 2"],
-  "suggestions": ["actionable suggestion 1", "actionable suggestion 2"],
-  "splitSuggestion": "how to split this PR if it's too large (omit this key if not needed)"
+  "summary": "2-3 sentences on WHAT this PR does and WHY (not how)",
+  "concerns": ["specific, actionable concern", "..."],
+  "suggestions": ["specific suggestion referencing actual code", "..."],
+  "splitSuggestion": "concrete split recommendation if the PR mixes unrelated concerns"
 }
 
 Rules:
-- summary: explain the WHAT and WHY, not how
-- concerns: only real issues, not nitpicks (max 4)
-- suggestions: actionable and specific (max 4)
-- splitSuggestion: only include if PR has 200+ lines changed across unrelated concerns
-- Keep each item under 120 characters`;
+- summary: non-obvious context only — what problem does this solve?
+- concerns: real code issues, logic bugs, security risks, performance (max 4, skip trivial style)
+- suggestions: reference actual function names, file names, or patterns in the diff (max 4)
+- splitSuggestion: omit the key entirely if the PR is focused
+- Each item under 130 characters`;
     const message = await client.messages.create({
-        model: 'claude-sonnet-4-6',
+        model: config.ai.model,
         max_tokens: 1024,
         messages: [{ role: 'user', content: prompt }],
     });
@@ -35701,7 +35701,7 @@ Rules:
         throw new Error('Unexpected AI response type');
     const jsonMatch = content.text.match(/\{[\s\S]*\}/);
     if (!jsonMatch)
-        throw new Error('Could not parse AI response as JSON');
+        throw new Error('Could not extract JSON from AI response');
     return JSON.parse(jsonMatch[0]);
 }
 
@@ -35709,53 +35709,98 @@ Rules:
 /***/ }),
 
 /***/ 8561:
-/***/ ((__unused_webpack_module, exports) => {
+/***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
 
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.runAnalysis = runAnalysis;
-const SECRET_PATTERNS = [
+const dependencies_1 = __nccwpck_require__(5110);
+const breaking_1 = __nccwpck_require__(5998);
+const BUILTIN_SECRET_PATTERNS = [
     { type: 'AWS Access Key', pattern: /AKIA[0-9A-Z]{16}/g },
-    { type: 'AWS Secret Key', pattern: /(?:aws_secret_access_key|aws_secret_key)\s*[:=]\s*['"]?([A-Za-z0-9/+=]{40})['"]?/gi },
+    { type: 'AWS Secret Key', pattern: /(?:aws_secret(?:_access)?_key)\s*[:=]\s*['"]?([A-Za-z0-9/+=]{40})['"]?/gi },
     { type: 'Private Key', pattern: /-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----/g },
-    { type: 'GitHub Token', pattern: /ghp_[A-Za-z0-9]{36}/g },
-    { type: 'GitHub OAuth Token', pattern: /gho_[A-Za-z0-9]{36}/g },
+    { type: 'GitHub Token', pattern: /gh[pousr]_[A-Za-z0-9]{36,}/g },
     { type: 'Slack Token', pattern: /xox[baprs]-(?:[0-9a-zA-Z]{10,48})/g },
-    { type: 'Generic Secret', pattern: /(?:api[_-]?key|apikey|api[_-]?secret|client[_-]?secret)\s*[:=]\s*['"]([A-Za-z0-9_\-]{20,})['"]?/gi },
-    { type: 'Database URL', pattern: /(?:postgres|mysql|mongodb)(?:\+\w+)?:\/\/[^@\s]+@[^\s'"]+/gi },
     { type: 'Google API Key', pattern: /AIza[0-9A-Za-z_\-]{35}/g },
     { type: 'Stripe Secret Key', pattern: /sk_(?:live|test)_[A-Za-z0-9]{24,}/g },
     { type: 'Anthropic API Key', pattern: /sk-ant-[A-Za-z0-9_\-]{40,}/g },
+    { type: 'Database URL', pattern: /(?:postgres|mysql|mongodb)(?:\+\w+)?:\/\/[^@\s]+@[^\s'"]+/gi },
+    { type: 'Generic Secret', pattern: /(?:api[_-]?key|api[_-]?secret|client[_-]?secret|auth[_-]?token)\s*[:=]\s*['"]([A-Za-z0-9_\-]{20,})['"]?/gi },
+    { type: 'Bearer Token', pattern: /Authorization:\s*Bearer\s+[A-Za-z0-9\-._~+/]+=*/gi },
+    { type: 'Basic Auth', pattern: /Authorization:\s*Basic\s+[A-Za-z0-9+/]+=*/gi },
+    { type: 'SSH Private Key', pattern: /(?:-----BEGIN OPENSSH PRIVATE KEY-----|PuTTY-User-Key-File)/g },
+    { type: 'Twilio Token', pattern: /SK[0-9a-fA-F]{32}/g },
+    { type: 'SendGrid Key', pattern: /SG\.[A-Za-z0-9_\-]{22}\.[A-Za-z0-9_\-]{43}/g },
+    { type: 'Azure Storage Key', pattern: /DefaultEndpointsProtocol=https;AccountName=\w+;AccountKey=[A-Za-z0-9+/=]{88}/g },
 ];
-const TEST_FILE_PATTERNS = [
-    /\.(test|spec)\.(ts|tsx|js|jsx)$/,
-    /^tests?\//,
-    /__tests__\//,
-];
-const SOURCE_DIR_PATTERNS = [
-    /^src\//,
-    /^lib\//,
-    /^app\//,
-];
-function runAnalysis(prData) {
+// Per-language test file patterns
+const TEST_PATTERNS = {
+    ts: [/\.(test|spec)\.(ts|tsx|js|jsx)$/, /__tests__\//, /\.test$/, /\.spec$/],
+    py: [/(?:^|\/)test_[^/]+\.py$/, /(?:^|\/)[^/]+_test\.py$/, /(?:^|\/)tests?\//],
+    go: [/_test\.go$/],
+    java: [/(?:Test|Tests|IT|Spec)\.(java|kt)$/, /\/src\/test\//],
+    rb: [/_spec\.rb$/, /(?:^|\/)spec\//],
+    php: [/Test\.php$/, /(?:^|\/)tests?\//],
+    rs: [/(?:^|\/)tests?\//],
+    cpp: [/[_.](?:test|spec)\.(c|cpp|cc|h|hpp)$/, /(?:^|\/)tests?\//],
+};
+const SOURCE_DIRS = [/^src\//, /^lib\//, /^app\//, /^packages\/[^/]+\/src\//];
+function getTestPatterns(filename) {
+    const ext = filename.split('.').pop() ?? '';
+    const map = {
+        ts: 'ts', tsx: 'ts', js: 'ts', jsx: 'ts', mjs: 'ts',
+        py: 'py',
+        go: 'go',
+        java: 'java', kt: 'java',
+        rb: 'rb',
+        php: 'php',
+        rs: 'rs',
+        c: 'cpp', cpp: 'cpp', cc: 'cpp', h: 'cpp', hpp: 'cpp',
+    };
+    return TEST_PATTERNS[map[ext] ?? 'ts'] ?? TEST_PATTERNS.ts;
+}
+function isTestFile(filename) {
+    const patterns = Object.values(TEST_PATTERNS).flat();
+    return patterns.some(p => p.test(filename));
+}
+function isIgnored(filename, ignorePaths) {
+    return ignorePaths.some(pattern => {
+        const re = new RegExp('^' + pattern.replace(/\./g, '\\.').replace(/\*\*/g, '.*').replace(/\*/g, '[^/]*') + '$');
+        return re.test(filename);
+    });
+}
+function runAnalysis(prData, config) {
+    const secretPatterns = [
+        ...BUILTIN_SECRET_PATTERNS,
+        ...config.custom_secrets.map(s => ({
+            type: s.name,
+            pattern: new RegExp(s.pattern, 'g'),
+        })),
+    ];
+    const filteredFiles = prData.files.filter(f => !isIgnored(f.filename, config.ignore.paths));
+    const filteredData = { ...prData, files: filteredFiles };
     return {
-        complexity: analyzeComplexity(prData),
-        secrets: detectSecrets(prData),
-        todos: detectTodos(prData),
-        coverageGaps: analyzeTestCoverage(prData),
+        complexity: analyzeComplexity(filteredData, config),
+        secrets: config.checks.secrets ? detectSecrets(filteredData, secretPatterns) : [],
+        todos: config.checks.todos ? detectTodos(filteredData) : [],
+        coverageGaps: config.checks.tests ? analyzeTestCoverage(filteredData) : [],
+        dependencies: config.checks.dependencies ? (0, dependencies_1.parseDependencyChanges)(filteredData.files) : [],
+        breaking: config.checks.breaking_changes ? (0, breaking_1.detectBreakingChanges)(filteredData.files) : [],
     };
 }
-function analyzeComplexity(prData) {
+function analyzeComplexity(prData, config) {
     const linesChanged = prData.additions + prData.deletions;
     const filesChanged = prData.changedFiles;
     const areas = detectAreas(prData.files.map(f => f.filename));
     let score;
+    const maxLines = config.thresholds.max_pr_lines;
     if (linesChanged < 50 && filesChanged <= 3)
         score = 'low';
     else if (linesChanged < 200 && filesChanged <= 10)
         score = 'medium';
-    else if (linesChanged < 500 && filesChanged <= 20)
+    else if (linesChanged < maxLines / 2 && filesChanged <= 20)
         score = 'high';
     else
         score = 'very-high';
@@ -35764,43 +35809,41 @@ function analyzeComplexity(prData) {
 }
 function detectAreas(filenames) {
     const areas = new Set();
-    for (const file of filenames) {
-        if (file.match(/test|spec/i))
+    for (const f of filenames) {
+        if (isTestFile(f))
             areas.add('tests');
-        else if (file.startsWith('src/') || file.startsWith('lib/'))
+        else if (SOURCE_DIRS.some(p => p.test(f)))
             areas.add('source');
-        if (file.startsWith('.github/'))
+        if (f.startsWith('.github/'))
             areas.add('ci/cd');
-        if (file.match(/\.(yml|yaml|toml|ini)$/i) && !file.startsWith('.github'))
+        if (/\.(yml|yaml|toml|ini|env\.example)$/i.test(f) && !f.startsWith('.github'))
             areas.add('config');
-        if (file.match(/\.(md|txt|rst)$/i))
+        if (/\.(md|txt|rst|mdx)$/i.test(f))
             areas.add('docs');
-        if (file.match(/\.(css|scss|html|tsx|vue|svelte)$/))
+        if (/\.(css|scss|sass|less|html|svelte|vue)$/.test(f))
             areas.add('frontend');
-        if (file.match(/migration|schema\.sql/i))
+        if (/migration|schema\.sql/i.test(f))
             areas.add('database');
     }
     return Array.from(areas);
 }
-function detectSecrets(prData) {
+function detectSecrets(prData, patterns) {
     const findings = [];
     for (const file of prData.files) {
         if (!file.patch)
+            continue;
+        // Skip lockfiles — lots of hashes that trigger false positives
+        if (/\.(lock|snap)$/.test(file.filename) || /package-lock\.json$/.test(file.filename))
             continue;
         const addedLines = file.patch
             .split('\n')
             .map((line, idx) => ({ line, number: idx + 1 }))
             .filter(({ line }) => line.startsWith('+') && !line.startsWith('+++'));
         for (const { line, number } of addedLines) {
-            for (const { type, pattern } of SECRET_PATTERNS) {
+            for (const { type, pattern } of patterns) {
                 pattern.lastIndex = 0;
                 if (pattern.test(line)) {
-                    findings.push({
-                        file: file.filename,
-                        line: number,
-                        type,
-                        snippet: line.slice(1, 80).trim(),
-                    });
+                    findings.push({ file: file.filename, line: number, type, snippet: line.slice(1, 80).trim() });
                 }
             }
         }
@@ -35815,38 +35858,378 @@ function detectTodos(prData) {
             continue;
         const lines = file.patch.split('\n');
         for (let i = 0; i < lines.length; i++) {
-            const match = lines[i].match(pattern);
-            if (match && !lines[i].startsWith('+++')) {
-                findings.push({
-                    file: file.filename,
-                    line: i + 1,
-                    text: match[2].trim().slice(0, 100),
-                });
+            const m = lines[i].match(pattern);
+            if (m && !lines[i].startsWith('+++')) {
+                findings.push({ file: file.filename, line: i + 1, text: m[2].trim().slice(0, 100) });
             }
         }
     }
     return findings;
 }
 function analyzeTestCoverage(prData) {
-    const gaps = [];
-    const changedTestFiles = new Set(prData.files
-        .filter(f => TEST_FILE_PATTERNS.some(p => p.test(f.filename)))
-        .map(f => f.filename));
+    const changedTestFiles = new Set(prData.files.filter(f => isTestFile(f.filename)).map(f => f.filename));
     const sourceFiles = prData.files.filter(f => {
-        const isSource = SOURCE_DIR_PATTERNS.some(p => p.test(f.filename));
-        const isTest = TEST_FILE_PATTERNS.some(p => p.test(f.filename));
-        const isConfig = /\.(json|yml|yaml|md|txt|lock)$/.test(f.filename);
+        const isSource = SOURCE_DIRS.some(p => p.test(f.filename));
+        const isTest = isTestFile(f.filename);
+        const isConfig = /\.(json|yml|yaml|md|txt|lock|snap)$/.test(f.filename);
         return isSource && !isTest && !isConfig;
     });
-    for (const file of sourceFiles) {
-        const baseName = file.filename
-            .replace(/^(src|lib|app)\//, '')
-            .replace(/\.(ts|tsx|js|jsx)$/, '');
-        const stem = baseName.split('/').pop() ?? baseName;
-        const hasTests = Array.from(changedTestFiles).some(t => t.includes(baseName) || t.includes(stem));
-        gaps.push({ file: file.filename, hasTests, isNewFile: file.status === 'added' });
+    return sourceFiles.map(file => {
+        const base = file.filename.replace(/^(?:src|lib|app)\//, '').replace(/\.(ts|tsx|js|jsx|py|go|java|rb|php|rs)$/, '');
+        const stem = base.split('/').pop() ?? base;
+        const hasTests = Array.from(changedTestFiles).some(t => t.includes(base) || t.includes(stem));
+        return { file: file.filename, hasTests, isNewFile: file.status === 'added' };
+    });
+}
+
+
+/***/ }),
+
+/***/ 5998:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.detectBreakingChanges = detectBreakingChanges;
+const EXPORTED_SYMBOL = /^-\s*export\s+(?:default\s+)?(?:function|class|const|let|var|type|interface|enum|abstract\s+class)\s+(\w+)/;
+const SQL_DESTRUCTIVE = [
+    { re: /^\+.*\bDROP\s+TABLE\b/i, desc: 'Table dropped' },
+    { re: /^\+.*\bDROP\s+COLUMN\b/i, desc: 'Column dropped' },
+    { re: /^\+.*\bTRUNCATE\b/i, desc: 'Table truncated' },
+    { re: /^\+.*\bALTER\s+TABLE\b.*\bDROP\b/i, desc: 'Column/constraint dropped via ALTER TABLE' },
+    { re: /^\+.*\bDROP\s+INDEX\b/i, desc: 'Index dropped' },
+];
+// Matches route definitions: app.get("/foo"), router.delete("/bar"), @DELETE("/baz"), etc.
+const ROUTE_PATTERN = /^[-]\s*(?:app|router)\.(get|post|put|patch|delete|all)\s*\(\s*['"`]([^'"`]+)/i;
+const DECORATOR_ROUTE = /^[-]\s*@(?:Get|Post|Put|Patch|Delete|All)\s*\(\s*['"`]([^'"`]+)/i;
+function detectBreakingChanges(files) {
+    const changes = [];
+    for (const file of files) {
+        if (!file.patch)
+            continue;
+        const lines = file.patch.split('\n');
+        if (/\.(ts|tsx|js|jsx|mjs|cjs)$/.test(file.filename)) {
+            for (let i = 0; i < lines.length; i++) {
+                const m = lines[i].match(EXPORTED_SYMBOL);
+                if (m) {
+                    changes.push({
+                        file: file.filename,
+                        line: i + 1,
+                        type: 'removed-export',
+                        description: `Exported \`${m[1]}\` was removed or renamed`,
+                    });
+                }
+            }
+        }
+        if (/\.(sql|migration\.(ts|js)|migrate\.(ts|js))$/.test(file.filename) || /migration/i.test(file.filename)) {
+            for (let i = 0; i < lines.length; i++) {
+                for (const { re, desc } of SQL_DESTRUCTIVE) {
+                    if (re.test(lines[i])) {
+                        changes.push({ file: file.filename, line: i + 1, type: 'sql-destructive', description: desc });
+                    }
+                }
+            }
+        }
+        if (/route|controller|router|handler/i.test(file.filename) && /\.(ts|tsx|js|py|go|rb)$/.test(file.filename)) {
+            for (let i = 0; i < lines.length; i++) {
+                const m = lines[i].match(ROUTE_PATTERN) || lines[i].match(DECORATOR_ROUTE);
+                if (m) {
+                    const path = m[2] ?? m[1];
+                    const method = m[1]?.toUpperCase() ?? '';
+                    changes.push({
+                        file: file.filename,
+                        line: i + 1,
+                        type: 'removed-route',
+                        description: `${method ? method + ' ' : ''}route \`${path}\` was removed`,
+                    });
+                }
+            }
+        }
     }
-    return gaps;
+    return changes;
+}
+
+
+/***/ }),
+
+/***/ 2973:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.loadConfig = loadConfig;
+const github = __importStar(__nccwpck_require__(3228));
+const core = __importStar(__nccwpck_require__(7484));
+const types_1 = __nccwpck_require__(8522);
+function mergeDeep(defaults, overrides) {
+    const result = { ...defaults };
+    for (const key of Object.keys(overrides)) {
+        const val = overrides[key];
+        if (val !== null && typeof val === 'object' && !Array.isArray(val)) {
+            result[key] = mergeDeep(defaults[key], val);
+        }
+        else if (val !== undefined) {
+            result[key] = val;
+        }
+    }
+    return result;
+}
+function parseSimpleYaml(content) {
+    const result = {};
+    const lines = content.split('\n');
+    const stack = [
+        { obj: result, indent: -1 },
+    ];
+    for (const raw of lines) {
+        if (!raw.trim() || raw.trim().startsWith('#'))
+            continue;
+        const indent = raw.length - raw.trimStart().length;
+        const line = raw.trim();
+        while (stack.length > 1 && stack[stack.length - 1].indent >= indent) {
+            stack.pop();
+        }
+        const current = stack[stack.length - 1].obj;
+        if (line.endsWith(':') && !line.includes(': ')) {
+            const key = line.slice(0, -1);
+            const child = {};
+            current[key] = child;
+            stack.push({ obj: child, indent });
+            continue;
+        }
+        const colonIdx = line.indexOf(': ');
+        if (colonIdx !== -1) {
+            const key = line.slice(0, colonIdx).trim();
+            const rawVal = line.slice(colonIdx + 2).trim();
+            let value = rawVal;
+            if (rawVal === 'true')
+                value = true;
+            else if (rawVal === 'false')
+                value = false;
+            else if (!isNaN(Number(rawVal)) && rawVal !== '')
+                value = Number(rawVal);
+            else if (rawVal.startsWith('"') || rawVal.startsWith("'")) {
+                value = rawVal.slice(1, -1);
+            }
+            current[key] = value;
+            continue;
+        }
+        if (line.startsWith('- ')) {
+            const parentKey = Object.keys(current).pop();
+            if (parentKey) {
+                if (!Array.isArray(current[parentKey]))
+                    current[parentKey] = [];
+                current[parentKey].push(line.slice(2).trim());
+            }
+        }
+    }
+    return result;
+}
+async function loadConfig(owner, repo, token) {
+    const octokit = github.getOctokit(token);
+    try {
+        const { data } = await octokit.rest.repos.getContent({ owner, repo, path: '.milo.yml' });
+        if (!('content' in data))
+            return types_1.DEFAULT_CONFIG;
+        const raw = Buffer.from(data.content, 'base64').toString('utf-8');
+        const parsed = parseSimpleYaml(raw);
+        core.info('📄 Loaded .milo.yml config');
+        return mergeDeep(types_1.DEFAULT_CONFIG, parsed);
+    }
+    catch {
+        return types_1.DEFAULT_CONFIG;
+    }
+}
+
+
+/***/ }),
+
+/***/ 5110:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.parseDependencyChanges = parseDependencyChanges;
+function parseMajor(version) {
+    return parseInt(version.replace(/^[\^~>=<v*]/, '').split('.')[0] ?? '0', 10) || 0;
+}
+function classifyChange(from, to) {
+    const fromMajor = parseMajor(from);
+    const toMajor = parseMajor(to);
+    if (toMajor > fromMajor)
+        return 'major-bump';
+    const fromNums = from.replace(/^[\^~>=<v]/, '').split('.').map(Number);
+    const toNums = to.replace(/^[\^~>=<v]/, '').split('.').map(Number);
+    for (let i = 0; i < 3; i++) {
+        const a = fromNums[i] ?? 0;
+        const b = toNums[i] ?? 0;
+        if (b > a)
+            return 'upgraded';
+        if (b < a)
+            return 'downgraded';
+    }
+    return 'upgraded';
+}
+function parseNpmChanges(file) {
+    if (!file.patch)
+        return [];
+    const removed = new Map();
+    const added = new Map();
+    let inDev = false;
+    for (const line of file.patch.split('\n')) {
+        const trimmed = line.trim();
+        if (trimmed.includes('"devDependencies"'))
+            inDev = true;
+        if (trimmed.includes('"dependencies"') && !trimmed.includes('dev'))
+            inDev = false;
+        const m = line.match(/^([+-])\s+"(@?[^"]+)":\s+"([^"]+)"/);
+        if (!m || m[2] === 'name' || m[2] === 'version')
+            continue;
+        const [, sign, name, version] = m;
+        const ver = version.replace(/^["']|["']$/g, '');
+        if (sign === '-')
+            removed.set(name, { ver, dev: inDev });
+        else
+            added.set(name, { ver, dev: inDev });
+    }
+    const changes = [];
+    for (const [name, { ver, dev }] of added) {
+        if (!removed.has(name)) {
+            changes.push({ name, from: null, to: ver, type: 'added', ecosystem: 'npm', isDevDependency: dev });
+        }
+    }
+    for (const [name, { ver, dev }] of removed) {
+        if (!added.has(name)) {
+            changes.push({ name, from: ver, to: null, type: 'removed', ecosystem: 'npm', isDevDependency: dev });
+        }
+    }
+    for (const [name, { ver: oldVer, dev }] of removed) {
+        const entry = added.get(name);
+        if (!entry)
+            continue;
+        changes.push({
+            name, from: oldVer, to: entry.ver,
+            type: classifyChange(oldVer, entry.ver),
+            ecosystem: 'npm', isDevDependency: dev,
+        });
+    }
+    return changes;
+}
+function parsePipChanges(file) {
+    if (!file.patch)
+        return [];
+    const removed = new Map();
+    const added = new Map();
+    for (const line of file.patch.split('\n')) {
+        const m = line.match(/^([+-])([A-Za-z0-9_\-]+)(==|>=|~=|<=)?(.+)?/);
+        if (!m)
+            continue;
+        const [, sign, name, , version] = m;
+        const ver = version?.trim() ?? '*';
+        if (sign === '-')
+            removed.set(name.toLowerCase(), ver);
+        else
+            added.set(name.toLowerCase(), ver);
+    }
+    const changes = [];
+    for (const [name, ver] of added) {
+        if (!removed.has(name))
+            changes.push({ name, from: null, to: ver, type: 'added', ecosystem: 'pip', isDevDependency: false });
+    }
+    for (const [name, ver] of removed) {
+        if (!added.has(name))
+            changes.push({ name, from: ver, to: null, type: 'removed', ecosystem: 'pip', isDevDependency: false });
+    }
+    for (const [name, oldVer] of removed) {
+        const newVer = added.get(name);
+        if (!newVer)
+            continue;
+        changes.push({ name, from: oldVer, to: newVer, type: classifyChange(oldVer, newVer), ecosystem: 'pip', isDevDependency: false });
+    }
+    return changes;
+}
+function parseGoChanges(file) {
+    if (!file.patch)
+        return [];
+    const removed = new Map();
+    const added = new Map();
+    for (const line of file.patch.split('\n')) {
+        const m = line.match(/^([+-])\s*require\s+(\S+)\s+(\S+)/) || line.match(/^([+-])\t(\S+)\s+(\S+)/);
+        if (!m)
+            continue;
+        const [, sign, name, ver] = m;
+        if (sign === '-')
+            removed.set(name, ver);
+        else
+            added.set(name, ver);
+    }
+    const changes = [];
+    for (const [name, ver] of added) {
+        if (!removed.has(name))
+            changes.push({ name, from: null, to: ver, type: 'added', ecosystem: 'go', isDevDependency: false });
+    }
+    for (const [name, ver] of removed) {
+        if (!added.has(name))
+            changes.push({ name, from: ver, to: null, type: 'removed', ecosystem: 'go', isDevDependency: false });
+    }
+    for (const [name, oldVer] of removed) {
+        const newVer = added.get(name);
+        if (!newVer)
+            continue;
+        changes.push({ name, from: oldVer, to: newVer, type: classifyChange(oldVer, newVer), ecosystem: 'go', isDevDependency: false });
+    }
+    return changes;
+}
+const DEP_FILE_PARSERS = [
+    { match: /(^|\/)package\.json$/, parse: parseNpmChanges },
+    { match: /(^|\/)requirements.*\.txt$/, parse: parsePipChanges },
+    { match: /(^|\/)go\.mod$/, parse: parseGoChanges },
+];
+function parseDependencyChanges(files) {
+    const all = [];
+    for (const file of files) {
+        for (const { match, parse } of DEP_FILE_PARSERS) {
+            if (match.test(file.filename)) {
+                all.push(...parse(file));
+            }
+        }
+    }
+    return all;
 }
 
 
@@ -35893,7 +36276,9 @@ var __importStar = (this && this.__importStar) || (function () {
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.fetchPRData = fetchPRData;
 exports.upsertComment = upsertComment;
+exports.createCheckRun = createCheckRun;
 const githubActions = __importStar(__nccwpck_require__(3228));
+const core = __importStar(__nccwpck_require__(7484));
 const reporter_1 = __nccwpck_require__(5622);
 async function fetchPRData(owner, repo, prNumber, token) {
     const octokit = githubActions.getOctokit(token);
@@ -35909,6 +36294,7 @@ async function fetchPRData(owner, repo, prNumber, token) {
         title: pr.title,
         description: pr.body ?? '',
         diff,
+        headSha: pr.head.sha,
         files: files.map(f => ({
             filename: f.filename,
             status: f.status,
@@ -35924,10 +36310,7 @@ async function fetchPRData(owner, repo, prNumber, token) {
 async function upsertComment(owner, repo, prNumber, body, token) {
     const octokit = githubActions.getOctokit(token);
     const { data: comments } = await octokit.rest.issues.listComments({
-        owner,
-        repo,
-        issue_number: prNumber,
-        per_page: 100,
+        owner, repo, issue_number: prNumber, per_page: 100,
     });
     const existing = comments.find(c => c.body?.includes(reporter_1.MILO_MARKER));
     if (existing) {
@@ -35935,6 +36318,62 @@ async function upsertComment(owner, repo, prNumber, body, token) {
     }
     else {
         await octokit.rest.issues.createComment({ owner, repo, issue_number: prNumber, body });
+    }
+}
+async function createCheckRun(owner, repo, headSha, analysis, healthScore, token) {
+    const octokit = githubActions.getOctokit(token);
+    const uncovered = analysis.coverageGaps.filter(g => !g.hasTests);
+    const hasFailure = analysis.secrets.length > 0;
+    const conclusion = hasFailure ? 'failure' : healthScore < 5 ? 'neutral' : 'success';
+    const annotations = [
+        ...analysis.secrets.map(s => ({
+            path: s.file,
+            start_line: s.line,
+            end_line: s.line,
+            annotation_level: 'failure',
+            title: `🚨 Potential ${s.type}`,
+            message: `Milo detected a possible ${s.type}. Review and remove before merging.\n\`${s.snippet}\``,
+        })),
+        ...analysis.breaking.map(b => ({
+            path: b.file,
+            start_line: b.line,
+            end_line: b.line,
+            annotation_level: 'warning',
+            title: `⚠️ Possible breaking change`,
+            message: b.description,
+        })),
+        ...uncovered.slice(0, 10).map(gap => ({
+            path: gap.file,
+            start_line: 1,
+            end_line: 1,
+            annotation_level: 'warning',
+            title: '🧪 No test coverage',
+            message: `${gap.isNewFile ? 'New file' : 'Modified file'} has no corresponding test changes.`,
+        })),
+    ];
+    const problems = [
+        analysis.secrets.length > 0 && `${analysis.secrets.length} secret(s) detected`,
+        uncovered.length > 0 && `${uncovered.length} file(s) without tests`,
+        analysis.breaking.length > 0 && `${analysis.breaking.length} breaking change(s)`,
+    ].filter(Boolean).join(' · ');
+    try {
+        await octokit.rest.checks.create({
+            owner, repo,
+            name: 'Milo PR Health',
+            head_sha: headSha,
+            status: 'completed',
+            conclusion,
+            output: {
+                title: `Health Score: ${healthScore}/10${problems ? ' · ' + problems : ''}`,
+                summary: `Milo analyzed this PR and assigned a health score of **${healthScore}/10**.\n\n${problems || 'No major issues found.'}`,
+                annotations: annotations.slice(0, 50),
+            },
+        });
+        core.info('✅ GitHub Check Run created.');
+    }
+    catch (err) {
+        // checks:write permission not granted — silently degrade
+        core.debug(`Check run skipped (checks:write not available): ${err}`);
     }
 }
 
@@ -35986,6 +36425,8 @@ const github_1 = __nccwpck_require__(9248);
 const analyzer_1 = __nccwpck_require__(8561);
 const ai_1 = __nccwpck_require__(2382);
 const reporter_1 = __nccwpck_require__(5622);
+const labeler_1 = __nccwpck_require__(5126);
+const config_1 = __nccwpck_require__(2973);
 async function run() {
     try {
         const token = core.getInput('github-token', { required: true });
@@ -35998,28 +36439,37 @@ async function run() {
         }
         const prNumber = context.payload.pull_request.number;
         const { owner, repo } = context.repo;
-        core.info(`🔍 Analyzing PR #${prNumber}...`);
-        const prData = await (0, github_1.fetchPRData)(owner, repo, prNumber, token);
+        core.info(`🔍 Milo analyzing PR #${prNumber}...`);
+        const [config, prData] = await Promise.all([
+            (0, config_1.loadConfig)(owner, repo, token),
+            (0, github_1.fetchPRData)(owner, repo, prNumber, token),
+        ]);
         core.info('📊 Running static analysis...');
-        const analysis = (0, analyzer_1.runAnalysis)(prData);
+        const analysis = (0, analyzer_1.runAnalysis)(prData, config);
         let aiAnalysis = null;
         if (anthropicKey) {
-            core.info('🤖 Running AI analysis with Claude...');
+            core.info('🤖 Running AI analysis...');
             try {
-                aiAnalysis = await (0, ai_1.getAIAnalysis)(prData, analysis, anthropicKey);
+                aiAnalysis = await (0, ai_1.getAIAnalysis)(prData, analysis, anthropicKey, config);
             }
             catch (err) {
-                core.warning(`AI analysis failed (static analysis still posted): ${err}`);
+                core.warning(`AI analysis failed — posting static results only: ${err}`);
             }
         }
-        else {
-            core.info('ℹ️  No ANTHROPIC_API_KEY provided — running static analysis only.');
-        }
-        const comment = (0, reporter_1.formatComment)(prData, analysis, aiAnalysis);
+        const healthScore = (0, reporter_1.calculateHealthScore)(analysis, prData);
+        const [appliedLabels] = await Promise.all([
+            (0, labeler_1.applyLabels)(owner, repo, prNumber, prData, analysis, config, token),
+            (0, github_1.createCheckRun)(owner, repo, prData.headSha, analysis, healthScore, token),
+        ]);
+        const comment = (0, reporter_1.formatComment)(prData, analysis, aiAnalysis, appliedLabels);
         await (0, github_1.upsertComment)(owner, repo, prNumber, comment, token);
-        core.info('✅ Milo comment posted.');
+        core.info(`✅ Milo done. Health score: ${healthScore}/10`);
+        if (config.thresholds.fail_on_score_below > 0 && healthScore < config.thresholds.fail_on_score_below) {
+            core.setFailed(`Health score ${healthScore}/10 is below threshold ${config.thresholds.fail_on_score_below}`);
+            return;
+        }
         if (failOnSecrets && analysis.secrets.length > 0) {
-            core.setFailed(`🚨 ${analysis.secrets.length} potential secret(s) detected in this PR.`);
+            core.setFailed(`🚨 ${analysis.secrets.length} potential secret(s) detected.`);
         }
     }
     catch (err) {
@@ -36027,6 +36477,125 @@ async function run() {
     }
 }
 run();
+
+
+/***/ }),
+
+/***/ 5126:
+/***/ (function(__unused_webpack_module, exports, __nccwpck_require__) {
+
+"use strict";
+
+var __createBinding = (this && this.__createBinding) || (Object.create ? (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    var desc = Object.getOwnPropertyDescriptor(m, k);
+    if (!desc || ("get" in desc ? !m.__esModule : desc.writable || desc.configurable)) {
+      desc = { enumerable: true, get: function() { return m[k]; } };
+    }
+    Object.defineProperty(o, k2, desc);
+}) : (function(o, m, k, k2) {
+    if (k2 === undefined) k2 = k;
+    o[k2] = m[k];
+}));
+var __setModuleDefault = (this && this.__setModuleDefault) || (Object.create ? (function(o, v) {
+    Object.defineProperty(o, "default", { enumerable: true, value: v });
+}) : function(o, v) {
+    o["default"] = v;
+});
+var __importStar = (this && this.__importStar) || (function () {
+    var ownKeys = function(o) {
+        ownKeys = Object.getOwnPropertyNames || function (o) {
+            var ar = [];
+            for (var k in o) if (Object.prototype.hasOwnProperty.call(o, k)) ar[ar.length] = k;
+            return ar;
+        };
+        return ownKeys(o);
+    };
+    return function (mod) {
+        if (mod && mod.__esModule) return mod;
+        var result = {};
+        if (mod != null) for (var k = ownKeys(mod), i = 0; i < k.length; i++) if (k[i] !== "default") __createBinding(result, mod, k[i]);
+        __setModuleDefault(result, mod);
+        return result;
+    };
+})();
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.applyLabels = applyLabels;
+const githubActions = __importStar(__nccwpck_require__(3228));
+const core = __importStar(__nccwpck_require__(7484));
+const LABEL_DEFS = {
+    'size/XS': { name: 'size/XS', color: 'c2e0c6', description: 'PR changes < 10 lines' },
+    'size/S': { name: 'size/S', color: '73c7c7', description: 'PR changes < 50 lines' },
+    'size/M': { name: 'size/M', color: '88e088', description: 'PR changes < 200 lines' },
+    'size/L': { name: 'size/L', color: 'ffd569', description: 'PR changes < 500 lines' },
+    'size/XL': { name: 'size/XL', color: 'c44d29', description: 'PR changes 500+ lines' },
+    'milo/needs-tests': { name: 'milo/needs-tests', color: 'fbca04', description: 'Source files changed without test coverage' },
+    'milo/secrets-found': { name: 'milo/secrets-found', color: 'd93f0b', description: 'Potential secrets detected by Milo' },
+    'milo/breaking-change': { name: 'milo/breaking-change', color: 'b60205', description: 'Possible breaking changes detected' },
+};
+function getSizeLabel(linesChanged) {
+    if (linesChanged < 10)
+        return 'size/XS';
+    if (linesChanged < 50)
+        return 'size/S';
+    if (linesChanged < 200)
+        return 'size/M';
+    if (linesChanged < 500)
+        return 'size/L';
+    return 'size/XL';
+}
+async function ensureLabelExists(octokit, owner, repo, labelName) {
+    const def = LABEL_DEFS[labelName];
+    if (!def)
+        return;
+    try {
+        await octokit.rest.issues.getLabel({ owner, repo, name: labelName });
+    }
+    catch {
+        try {
+            await octokit.rest.issues.createLabel({
+                owner, repo,
+                name: def.name,
+                color: def.color,
+                description: def.description,
+            });
+        }
+        catch (err) {
+            core.debug(`Could not create label ${labelName}: ${err}`);
+        }
+    }
+}
+async function applyLabels(owner, repo, prNumber, prData, analysis, config, token) {
+    if (!config.labels.enabled)
+        return [];
+    const octokit = githubActions.getOctokit(token);
+    const labelsToApply = [];
+    if (config.labels.size) {
+        labelsToApply.push(getSizeLabel(prData.additions + prData.deletions));
+    }
+    if (config.labels.needs_tests && analysis.coverageGaps.some(g => !g.hasTests)) {
+        labelsToApply.push('milo/needs-tests');
+    }
+    if (config.labels.security && analysis.secrets.length > 0) {
+        labelsToApply.push('milo/secrets-found');
+    }
+    if (config.labels.breaking_change && analysis.breaking.length > 0) {
+        labelsToApply.push('milo/breaking-change');
+    }
+    for (const label of labelsToApply) {
+        await ensureLabelExists(octokit, owner, repo, label);
+    }
+    try {
+        await octokit.rest.issues.addLabels({
+            owner, repo, issue_number: prNumber, labels: labelsToApply,
+        });
+        core.info(`🏷️  Labels applied: ${labelsToApply.join(', ')}`);
+    }
+    catch (err) {
+        core.warning(`Could not apply labels: ${err}`);
+    }
+    return labelsToApply;
+}
 
 
 /***/ }),
@@ -36039,13 +36608,16 @@ run();
 Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.MILO_MARKER = void 0;
 exports.formatComment = formatComment;
+exports.calculateHealthScore = calculateHealthScore;
 exports.MILO_MARKER = '<!-- milo-pr-health-check -->';
-function formatComment(prData, analysis, aiAnalysis) {
+function formatComment(prData, analysis, aiAnalysis, appliedLabels) {
     const score = calculateHealthScore(analysis, prData);
-    const scoreEmoji = score >= 8 ? '🟢' : score >= 5 ? '🟡' : '🔴';
     const uncovered = analysis.coverageGaps.filter(g => !g.hasTests);
+    const majorBumps = analysis.dependencies.filter(d => d.type === 'major-bump');
+    const addedDeps = analysis.dependencies.filter(d => d.type === 'added');
+    const scoreEmoji = score >= 8 ? '🟢' : score >= 5 ? '🟡' : '🔴';
     const lines = [exports.MILO_MARKER, ''];
-    lines.push(`## ${scoreEmoji} Milo — PR Health Score: **${score}/10**`);
+    lines.push(`## ${scoreEmoji} Milo — Health Score: **${score}/10**`);
     lines.push('');
     if (aiAnalysis?.summary) {
         lines.push('### 📋 Summary');
@@ -36054,38 +36626,81 @@ function formatComment(prData, analysis, aiAnalysis) {
     }
     // Health table
     lines.push('<details open>');
-    lines.push('<summary><strong>🏥 Health Checks</strong></summary>');
+    lines.push('<summary><b>🏥 Health Checks</b></summary>');
     lines.push('');
     lines.push('| | Check | Status |');
     lines.push('|--|-------|--------|');
     const hasDesc = (prData.description ?? '').trim().length > 20;
-    lines.push(`| ${hasDesc ? '✅' : '⚠️'} | Description | ${hasDesc ? 'Provided' : 'Missing or too short — reviewers need context'} |`);
-    lines.push(`| ${analysis.secrets.length === 0 ? '✅' : '🚨'} | Secrets | ${analysis.secrets.length === 0 ? 'None detected' : `**${analysis.secrets.length} potential secret(s) found!**`} |`);
-    lines.push(`| ${uncovered.length === 0 ? '✅' : '⚠️'} | Test coverage | ${uncovered.length === 0 ? 'All changed source files have tests' : `${uncovered.length} file(s) changed without tests`} |`);
+    lines.push(`| ${hasDesc ? '✅' : '⚠️'} | Description | ${hasDesc ? 'Provided' : 'Missing or too short'} |`);
+    lines.push(`| ${analysis.secrets.length === 0 ? '✅' : '🚨'} | Secrets | ${analysis.secrets.length === 0 ? 'None detected' : `**${analysis.secrets.length} potential secret(s) found**`} |`);
+    lines.push(`| ${uncovered.length === 0 ? '✅' : '⚠️'} | Tests | ${uncovered.length === 0 ? 'All changed source files covered' : `${uncovered.length} file(s) without test updates`} |`);
     lines.push(`| ${analysis.todos.length === 0 ? '✅' : '⚠️'} | TODOs | ${analysis.todos.length === 0 ? 'None added' : `${analysis.todos.length} new TODO/FIXME`} |`);
+    lines.push(`| ${analysis.breaking.length === 0 ? '✅' : '⚠️'} | Breaking changes | ${analysis.breaking.length === 0 ? 'None detected' : `${analysis.breaking.length} possible breaking change(s)`} |`);
     const sizeOk = analysis.complexity.score === 'low' || analysis.complexity.score === 'medium';
-    lines.push(`| ${sizeOk ? '✅' : '⚠️'} | PR size | +${prData.additions}/-${prData.deletions} lines across ${prData.changedFiles} files |`);
+    lines.push(`| ${sizeOk ? '✅' : '⚠️'} | PR size | +${prData.additions}/-${prData.deletions} lines · ${prData.changedFiles} files |`);
+    if (analysis.dependencies.length > 0) {
+        lines.push(`| ${majorBumps.length === 0 ? '✅' : '⚠️'} | Dependencies | ${formatDepSummary(analysis.dependencies)} |`);
+    }
     lines.push('');
     lines.push('</details>');
     lines.push('');
+    // Secrets
     if (analysis.secrets.length > 0) {
-        lines.push('### 🚨 Potential Secrets — Review Immediately');
+        lines.push('### 🚨 Secrets Detected — Do Not Merge');
+        lines.push('> These lines match known secret patterns. Remove or rotate before merging.');
+        lines.push('');
         for (const s of analysis.secrets) {
-            lines.push(`- **${s.type}** in \`${s.file}\` line ${s.line}`);
+            lines.push(`- **${s.type}** · \`${s.file}\` line ${s.line}`);
         }
         lines.push('');
     }
+    // Breaking changes
+    if (analysis.breaking.length > 0) {
+        lines.push('<details>');
+        lines.push(`<summary>⚠️ <b>${analysis.breaking.length} possible breaking change(s)</b></summary>`);
+        lines.push('');
+        for (const b of analysis.breaking) {
+            const icon = b.type === 'sql-destructive' ? '🗄️' : b.type === 'removed-route' ? '🛣️' : '📦';
+            lines.push(`- ${icon} \`${b.file}:${b.line}\` — ${b.description}`);
+        }
+        lines.push('');
+        lines.push('</details>');
+        lines.push('');
+    }
+    // Test coverage
     if (uncovered.length > 0) {
-        lines.push('### 🧪 Missing Test Coverage');
-        lines.push('These files were changed or added without corresponding test updates:');
+        lines.push('<details>');
+        lines.push(`<summary>🧪 <b>${uncovered.length} file(s) without test coverage</b></summary>`);
+        lines.push('');
         for (const gap of uncovered) {
-            lines.push(`- \`${gap.file}\`${gap.isNewFile ? ' *(new file)*' : ''}`);
+            lines.push(`- \`${gap.file}\`${gap.isNewFile ? ' *(new)*' : ''}`);
         }
         lines.push('');
+        lines.push('</details>');
+        lines.push('');
     }
+    // Dependencies
+    if (analysis.dependencies.length > 0 && (majorBumps.length > 0 || addedDeps.length > 0)) {
+        lines.push('<details>');
+        lines.push(`<summary>📦 <b>Dependency changes</b></summary>`);
+        lines.push('');
+        lines.push('| Package | Change | Version |');
+        lines.push('|---------|--------|---------|');
+        for (const d of analysis.dependencies.slice(0, 15)) {
+            const emoji = d.type === 'major-bump' ? '⚠️' : d.type === 'added' ? '➕' : d.type === 'removed' ? '➖' : '↑';
+            const ver = d.from && d.to ? `\`${d.from}\` → \`${d.to}\`` : d.to ? `\`${d.to}\`` : `\`${d.from}\``;
+            lines.push(`| \`${d.name}\` | ${emoji} ${d.type} | ${ver} |`);
+        }
+        if (analysis.dependencies.length > 15)
+            lines.push(`| *...and ${analysis.dependencies.length - 15} more* | | |`);
+        lines.push('');
+        lines.push('</details>');
+        lines.push('');
+    }
+    // TODOs
     if (analysis.todos.length > 0) {
         lines.push('<details>');
-        lines.push(`<summary>📌 ${analysis.todos.length} new TODO/FIXME added</summary>`);
+        lines.push(`<summary>📌 <b>${analysis.todos.length} new TODO/FIXME</b></summary>`);
         lines.push('');
         for (const t of analysis.todos.slice(0, 6)) {
             lines.push(`- \`${t.file}:${t.line}\` — ${t.text}`);
@@ -36096,6 +36711,7 @@ function formatComment(prData, analysis, aiAnalysis) {
         lines.push('</details>');
         lines.push('');
     }
+    // AI analysis
     if (aiAnalysis) {
         if (aiAnalysis.concerns.length > 0) {
             lines.push('### ⚠️ Concerns');
@@ -36115,22 +36731,42 @@ function formatComment(prData, analysis, aiAnalysis) {
             lines.push('');
         }
     }
-    lines.push(`### ⏱️ Estimated Review Time: ~${analysis.complexity.estimatedReviewMinutes} min`);
+    // Footer
+    const reviewInfo = [`⏱️ ~${analysis.complexity.estimatedReviewMinutes} min to review`];
     if (analysis.complexity.areas.length > 0) {
-        lines.push(`> Areas touched: ${analysis.complexity.areas.map(a => `\`${a}\``).join(', ')}`);
+        reviewInfo.push(`areas: ${analysis.complexity.areas.map(a => `\`${a}\``).join(' ')}`);
     }
-    lines.push('');
-    lines.push('---');
-    lines.push('*[Milo](https://github.com/yvtckvulsr/milo) — zero-config AI PR health checks*');
+    if (appliedLabels.length > 0) {
+        reviewInfo.push(`labels: ${appliedLabels.map(l => `\`${l}\``).join(' ')}`);
+    }
+    lines.push(`---`);
+    lines.push(`*${reviewInfo.join(' · ')} · [Milo](https://github.com/yvtckvulsr/milo)*`);
     return lines.join('\n');
+}
+function formatDepSummary(deps) {
+    const parts = [];
+    const added = deps.filter(d => d.type === 'added').length;
+    const removed = deps.filter(d => d.type === 'removed').length;
+    const major = deps.filter(d => d.type === 'major-bump').length;
+    if (added)
+        parts.push(`${added} added`);
+    if (removed)
+        parts.push(`${removed} removed`);
+    if (major)
+        parts.push(`${major} major bump${major > 1 ? 's' : ''}`);
+    return parts.join(', ') || `${deps.length} change(s)`;
 }
 function calculateHealthScore(analysis, prData) {
     let score = 10;
     if (analysis.secrets.length > 0)
         score -= 4;
-    const uncoveredCount = analysis.coverageGaps.filter(g => !g.hasTests).length;
-    score -= Math.min(uncoveredCount * 0.5, 2);
-    score -= Math.min(analysis.todos.length * 0.3, 1.5);
+    const uncovered = analysis.coverageGaps.filter(g => !g.hasTests).length;
+    score -= Math.min(uncovered * 0.5, 2);
+    score -= Math.min(analysis.todos.length * 0.25, 1.5);
+    if (analysis.breaking.length > 0)
+        score -= Math.min(analysis.breaking.length * 0.5, 1.5);
+    if (analysis.dependencies.filter(d => d.type === 'major-bump').length > 0)
+        score -= 0.5;
     if (analysis.complexity.score === 'high')
         score -= 0.5;
     if (analysis.complexity.score === 'very-high')
@@ -36139,6 +36775,45 @@ function calculateHealthScore(analysis, prData) {
         score -= 0.5;
     return Math.max(0, Math.round(score * 10) / 10);
 }
+
+
+/***/ }),
+
+/***/ 8522:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.DEFAULT_CONFIG = void 0;
+exports.DEFAULT_CONFIG = {
+    checks: {
+        secrets: true,
+        tests: true,
+        todos: true,
+        complexity: true,
+        dependencies: true,
+        breaking_changes: true,
+    },
+    labels: {
+        enabled: true,
+        size: true,
+        needs_tests: true,
+        security: true,
+        breaking_change: true,
+    },
+    thresholds: {
+        fail_on_score_below: 0,
+        max_pr_lines: 1000,
+    },
+    ignore: {
+        paths: [],
+    },
+    custom_secrets: [],
+    ai: {
+        model: 'claude-sonnet-4-6',
+    },
+};
 
 
 /***/ }),
